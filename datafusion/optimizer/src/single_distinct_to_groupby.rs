@@ -198,7 +198,10 @@ fn rewrite_pays(
         }
         let arg_types: Vec<_> = args
             .iter()
-            .map(|arg| arg.get_type(input_schema).unwrap_or(arrow::datatypes::DataType::Null))
+            .map(|arg| {
+                arg.get_type(input_schema)
+                    .unwrap_or(arrow::datatypes::DataType::Null)
+            })
             .collect();
         if func.groups_accumulator_supported_for_types(&arg_types, true) == Some(false) {
             return true;
