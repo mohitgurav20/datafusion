@@ -1298,8 +1298,8 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_distinct_handling_is_not_rewritten() -> Result<()> {
-        let table_scan = test_table_scan()?;
+    fn test_unsupported_distinct_handling_is_not_rewritten() {
+        let table_scan = test_table_scan().unwrap();
 
         // approx_median returns DistinctHandling::Unsupported
         let aggr_expr = Expr::AggregateFunction(AggregateFunction::new_udf(
@@ -1312,8 +1312,10 @@ mod tests {
         ));
 
         let plan = LogicalPlanBuilder::from(table_scan)
-            .aggregate(vec![col("a")], vec![aggr_expr])?
-            .build()?;
+            .aggregate(vec![col("a")], vec![aggr_expr])
+            .unwrap()
+            .build()
+            .unwrap();
 
         // The rule should rewrite the plan because approx_median doesn't support DISTINCT natively,
         // so it requires SingleDistinctToGroupBy to deduplicate the input.
@@ -1328,6 +1330,6 @@ mod tests {
             Aggregate: groupBy=[[test.a, test.b AS alias1]], aggr=[[]] [a:UInt32, alias1:UInt32]
               TableScan: test [a:UInt32, b:UInt32, c:UInt32]
         ",
-        )
+        ).unwrap();
     }
 }
