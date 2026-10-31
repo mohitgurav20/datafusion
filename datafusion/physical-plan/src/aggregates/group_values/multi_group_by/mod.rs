@@ -36,7 +36,7 @@ use datafusion_common::float_semantics::{has_float_leaf, normalize_floats};
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::{Result, not_impl_err};
-use datafusion_execution::memory_pool::proxy::{HashTableAllocExt, VecAllocExt};
+use datafusion_execution::memory_pool::proxy::VecAllocExt;
 use datafusion_expr::{EmitTo, GroupSelection};
 use datafusion_physical_expr::binary_map::OutputType;
 
@@ -181,9 +181,6 @@ pub struct GroupValuesColumn<const STREAMING: bool> {
     ///
     map: HashTable<(u64, GroupIndexView)>,
 
-    /// The size of `map` in bytes
-    map_size: usize,
-
     /// The lists for group indices with the same hash value
     ///
     /// It is possible that hash value collision exists,
@@ -294,7 +291,6 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
             group_index_lists: Vec::new(),
             emit_group_index_list_buffer: Vec::new(),
             vectorized_operation_buffers: VectorizedOperationBuffers::default(),
-            map_size: 0,
             group_values,
             hashes_buffer: Default::default(),
             random_state: crate::aggregates::AGGREGATION_HASH_SEED,
@@ -435,10 +431,10 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
                     }
 
                     // for hasher function, use precomputed hash value
-                    self.map.insert_accounted(
+                    self.map.insert_unique(
+                        target_hash,
                         (target_hash, GroupIndexView::new_inlined(group_idx as u64)),
                         |(hash, _group_index)| *hash,
-                        &mut self.map_size,
                     );
                     group_idx
                 }
@@ -555,10 +551,10 @@ impl<const STREAMING: bool> GroupValuesColumn<STREAMING> {
 
                 // Insert the `group index view` and its hash into `map`
                 // for hasher function, use precomputed hash value
-                self.map.insert_accounted(
+                self.map.insert_unique(
+                    target_hash,
                     (target_hash, group_index_view),
                     |(hash, _)| *hash,
-                    &mut self.map_size,
                 );
 
                 // Add row index to `vectorized_append_row_indices`
@@ -1083,9 +1079,12 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                 .iter()
                 .map(VecAllocExt::allocated_size)
                 .sum::<usize>();
+        // `HashTable::allocation_size` reports the complete retained allocation —
+        // including hashbrown control bytes and trailing layout — which is exactly
+        // what we want here. This follows the same approach as `ArrowBytesMap::size()`.
         size_of::<Self>()
             + group_values_size
-            + self.map_size
+            + self.map.allocation_size()
             + group_index_lists_size
             + self.emit_group_index_list_buffer.allocated_size()
             + self.vectorized_operation_buffers.size()
@@ -1224,7 +1223,6 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
 
     fn shrink_to_fit(&mut self) {
         self.map.shrink_to_fit(|(hash, _)| *hash);
-        self.map_size = self.map.capacity() * size_of::<(u64, usize)>();
         // Scratch for one `intern` call.
         self.hashes_buffer.clear();
         self.hashes_buffer.shrink_to_fit();
@@ -1244,7 +1242,6 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
             .expect("schema previously validated in try_new");
         self.map.clear();
         self.map.shrink_to(num_rows, |_| 0); // hasher does not matter since the map is cleared
-        self.map_size = self.map.capacity() * size_of::<(u64, usize)>();
         self.hashes_buffer.clear();
         self.hashes_buffer.shrink_to(num_rows);
 
@@ -1294,7 +1291,7 @@ mod tests {
         compute::{concat_batches, take},
         util::pretty::pretty_format_batches,
     };
-    use datafusion_common::{Result, utils::proxy::HashTableAllocExt};
+    use datafusion_common::Result;
     use datafusion_expr::{EmitTo, GroupSelection};
 
     use crate::aggregates::group_values::{
@@ -2764,10 +2761,10 @@ mod tests {
         group_index: u64,
     ) {
         let group_index_view = GroupIndexView::new_inlined(group_index);
-        group_values.map.insert_accounted(
+        group_values.map.insert_unique(
+            hash_key,
             (hash_key, group_index_view),
             |(hash, _)| *hash,
-            &mut group_values.map_size,
         );
     }
 
@@ -2779,10 +2776,85 @@ mod tests {
         let list_offset = group_values.group_index_lists.len();
         let group_index_view = GroupIndexView::new_non_inlined(list_offset as u64);
         group_values.group_index_lists.push(group_indices);
-        group_values.map.insert_accounted(
+        group_values.map.insert_unique(
+            hash_key,
             (hash_key, group_index_view),
             |(hash, _)| *hash,
-            &mut group_values.map_size,
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for exact hash-table allocation accounting (issue #25736)
+    // -----------------------------------------------------------------------
+
+    /// After enough groups are inserted to force a hashbrown table growth,
+    /// `size()` must include the full `allocation_size()` of the map — control
+    /// bytes and trailing layout included — not just an entry-capacity estimate.
+    #[test]
+    fn test_exact_hash_table_allocation_accounting() -> Result<()> {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let mut group_values: GroupValuesColumn<false> =
+            GroupValuesColumn::try_new(Arc::clone(&schema))?;
+
+        // 1. Initial state: map is unallocated
+        assert_eq!(group_values.map.capacity(), 0);
+        assert_eq!(group_values.map.allocation_size(), 0);
+
+        // 2. Insert multi-column keys and observe table allocation growth
+        let num_distinct = 500;
+        let col_a = Arc::new(Int32Array::from_iter_values(0..num_distinct)) as ArrayRef;
+        let col_b = Arc::new(StringArray::from_iter_values(
+            (0..num_distinct).map(|i| format!("key_string_{i}")),
+        )) as ArrayRef;
+
+        let mut groups = vec![];
+        group_values.intern(&[col_a, col_b], &mut groups)?;
+        assert_eq!(groups.len(), num_distinct as usize);
+
+        let table_bytes = group_values.map.allocation_size();
+        assert!(group_values.map.capacity() >= num_distinct as usize);
+        assert!(table_bytes > 0);
+
+        // 3. Partial emit (EmitTo::First) - table retains capacity
+        let emit_count = 200;
+        let emitted = group_values.emit(EmitTo::First(emit_count))?;
+        assert_eq!(emitted[0].len(), emit_count);
+        assert_eq!(group_values.len(), (num_distinct as usize) - emit_count);
+
+        // Retained capacity is still charged until the table releases it
+        assert_eq!(group_values.map.allocation_size(), table_bytes);
+
+        // 4. Emit all (EmitTo::All) - map is cleared but capacity remains allocated for reuse
+        let remaining_count = group_values.len();
+        let emitted_all = group_values.emit(EmitTo::All)?;
+        assert_eq!(emitted_all[0].len(), remaining_count);
+        assert_eq!(group_values.len(), 0);
+
+        // Clear preserves table capacity
+        assert_eq!(group_values.map.allocation_size(), table_bytes);
+
+        // 5. clear_shrink: releases/shrinks map capacity
+        group_values.clear_shrink(16);
+        let shrunken_table_bytes = group_values.map.allocation_size();
+        assert!(
+            shrunken_table_bytes < table_bytes,
+            "clear_shrink should shrink table from {table_bytes} to {shrunken_table_bytes}"
+        );
+
+        // 6. Reinsert new distinct values into the shrunken table
+        let new_col_a =
+            Arc::new(Int32Array::from_iter_values(num_distinct..num_distinct * 2))
+                as ArrayRef;
+        let new_col_b = Arc::new(StringArray::from_iter_values(
+            (num_distinct..num_distinct * 2).map(|i| format!("key_string_{i}")),
+        )) as ArrayRef;
+        group_values.intern(&[new_col_a, new_col_b], &mut groups)?;
+        assert_eq!(groups.len(), num_distinct as usize);
+        assert!(group_values.map.allocation_size() > shrunken_table_bytes);
+
+        Ok(())
     }
 }
